@@ -1,0 +1,107 @@
+import os
+import cv2
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+# Load the dataset
+image_dir = 'images/'
+annotation_file = 'annotations.csv'
+
+# Read the annotations
+annotations = pd.read_csv(annotation_file)
+
+# Load the images and annotations
+images = []
+bounding_boxes = []
+for index, row in annotations.iterrows():
+    image = cv2.imread(os.path.join(image_dir, row['filename']))
+    images.append(cv2.resize(image, (224, 224)))  # Resize to 224x224
+    bounding_boxes.append([row['xmin'], row['ymin'], row['xmax'], row['ymax']])
+
+# Split the data into train and test sets
+X_train, X_test, y_train, y_test = train_test_split(images, bounding_boxes, test_size=0.2, random_state=42)
+
+
+import tensorflow as tf
+from object_detection.utils import config_util
+from object_detection.builders import model_builder
+
+# Load the configurationfor the pre-trained model
+configs = config_util.get_configs_from_pipeline_file('faster_rcnn_resnet50_v1_640x640_coco17_tpu-8/pipeline.config')
+
+# Build the model
+detection_model = model_builder.build(model_config=configs['model'], is_training=False)
+
+# Load the pre-trained weights
+ckpt = tf.compat.v2.train.Checkpoint(model=detection_model)
+ckpt.restore(os.path.join('faster_rcnn_resnet50_v1_640x640_coco17_tpu-8', 'ckpt-0')).expect_partial()
+
+# Function to run inference on an image
+@tf.function
+def detect_fn(image):
+    image, shapes = detection_model.preprocess(image)
+    prediction_dict = detection_model.predict(image, shapes)
+    detections = detection_model.postprocess(prediction_dict, shapes)
+    return detections
+
+
+# Convert the data to TensorFlow datasets
+train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
+test_dataset = tf.data.Dataset.from_tensor_slices((X_test, y_test))
+
+# Define the loss and optimizer
+loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+optimizer = tf.keras.optimizers.Adam()
+
+# Define the train step
+@tf.function
+def train_step(images, labels):
+    with tf.GradientTape() as tape:
+        # Forward pass
+        predictions = detection_model(images, training=True)
+        loss = loss_object(labels, predictions)
+    # Backward pass
+    gradients = tape.gradient(loss, detection_model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, detection_model.trainable_variables))
+
+# Train the model
+for epoch in range(10):
+    for images, labels in train_dataset:
+        train_step(images, labels)
+
+from object_detection.core import standard_fields
+from object_detection.metrics import tf_example_parser
+from object_detection.metrics import coco_evaluation
+
+# Convert the test data to tf.Examples
+tf_examples = tf_example_parser.TfExampleDetectionAndGTParser().parse(test_dataset)
+
+# Run evaluation
+evaluator = coco_evaluation.CocoDetectionEvaluator(coco_evaluator_options={'include_metrics_per_category': True})
+for example in tf_examples:
+    evaluator.add_single_detected_image_info(example[standard_fields.DetectionResultFields.key], example)
+metrics = evaluator.evaluate()
+
+
+from keras.models import load_model
+from keras.preprocessing.image import load_img, img_to_array
+
+# Load the pre-trained YOLO model
+model = load_model('yolo.h5')
+
+# Function to run inference on an image
+def detect_objects(image_path):
+    # Load and preprocess the image
+    image = load_img(image_path, target_size=(416, 416))  # YOLO uses an input size of 416x416
+    image = img_to_array(image) / 255.  # Normalize to [0, 1]
+    image = np.expand_dims(image, axis=0)  # Add batch dimension
+
+    # Run inference
+    boxes, scores, classes = model.predict(image)
+
+    # Postprocess the output
+    for box, score, class in zip(boxes[0], scores[0], classes[0]):
+        if score > 0.5:  # Confidence threshold
+            print(f'Detected object: {class} ({score:.2f}) at {box}')
+
+
